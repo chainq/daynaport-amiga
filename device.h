@@ -40,16 +40,6 @@
 #define DOSBase       db->db_DOSBase
 #define UtilityBase   db->db_UtilityBase
 
-struct DevUnit {
-	/* HW Data (generic for now) (example only, unused in construct)*/
-	ULONG	du_hwl0;
-	ULONG	du_hwl1;
-	ULONG	du_hwl2;
-	APTR	du_hwp0;
-	APTR	du_hwp1;
-	APTR	du_hwp2;
-};
-
 struct devbase {
 	struct Library db_Lib;
 	BPTR db_SegList;            /* from Device Init */
@@ -58,14 +48,19 @@ struct devbase {
 	struct Library *db_DOSBase;
 	struct Library *db_UtilityBase;
 	struct Sana2DeviceStats db_DevStats;
+	
+	struct Hook *db_logHook;  
+	BOOL db_decrementCountOnFail;
+	
+	SHORT scsi_deviceID;                     // SCSI ID (0-7)
+	
+    STRPTR db_pendingOpenMsg;
 
 	volatile USHORT db_online;
 	volatile USHORT db_currentWifiState;   // the *actual* online state
 
     // SCSI device (in the main task)
 	void* db_scsiSettings;    // A pointer to a ScsiDaynaSettings struct  
-	USHORT db_scsiDeviceID;	  // The device ID that should be used going forward (auto-detect)
-	USHORT db_scsiMode;       // Scsi mode
 	struct List db_ReadList;
 	struct SignalSemaphore db_ReadListSem;
 	struct List db_WriteList;

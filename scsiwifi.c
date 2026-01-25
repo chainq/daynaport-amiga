@@ -11,6 +11,10 @@
 #include <proto/dos.h>
 #include <proto/utility.h>
 #include <devices/scsidisk.h>
+#include <proto/exec.h>
+#include <exec/types.h>
+#include <exec/memory.h>
+#include <stdarg.h>
 #include <string.h>
 #include "macros.h"
 #include <stdio.h>
@@ -80,9 +84,38 @@ void muldiv(USHORT num, USHORT divide, USHORT* result, USHORT* mod) {
     *mod = num;
 }
 
+static const UWORD stuffChar[] = {0x16c0, 0x4e75};
+
+
+// Formats a strung using RawDoFmt and then allocates memory to store it. String can only be upto 128 bytes long
+char *formatNewString(void *sysBase, const char *fmt, ...) {
+    struct SCSIDevice devTmp; LSCSIDevice dev = &devTmp; devTmp.sc_SysBase = (struct ExecBase*)sysBase;	
+    char temp[128], *p;
+    va_list args;
+    va_start(args, fmt);
+    p = temp;
+	 
+    RawDoFmt((STRPTR)fmt, (APTR)args, (void (*)(void))stuffChar, &p);
+	va_end(args);
+
+    int len = p - temp;
+    char *buf = AllocMem(len + 1, MEMF_PUBLIC);   
+    if (!buf) return NULL;
+
+    for (int i = 0; i < len; i++) buf[i] = temp[i];
+    buf[len] = 0;
+
+    return buf; 
+}
+
+void freeString(void *sysBase, char* string) {
+	struct SCSIDevice devTmp; LSCSIDevice dev = &devTmp; devTmp.sc_SysBase = (struct ExecBase*)sysBase;
+	if (string) FreeMem(string, strlen(string)+1);
+}
+
 // convert USHORT to string and appends a new line character
-void _ustoa(USHORT num, char* str) {
-    char buffer[16];
+void _ustoa(USHORT num, char* str) {	
+    char buffer[8];
     char* s = buffer;
     USHORT divres, divmod;
     do {
@@ -98,7 +131,7 @@ void _ustoa(USHORT num, char* str) {
 
 // convert SHORT to string and appends a new line character
 void _stoa(SHORT num, char* str) {
-    char buffer[16];
+    char buffer[10];
     char* s = buffer;
     USHORT divres, divmod, number;
 

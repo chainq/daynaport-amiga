@@ -109,6 +109,7 @@ struct SCSIDevice_OpenData {
     char* deviceDriverName;             // SCSI Driver to use (eg: scsi.device or gvpscsi.device etc)
 };
 
+
 // Populates settings with default values
 void SCSIWifi_defaultSettings(struct ScsiDaynaSettings* settings);
 
@@ -160,6 +161,10 @@ LONG SCSIWifi_sendFrame(SCSIWIFIDevice device, UBYTE* packet, UWORD packetSize);
 //           2, 3, 4 = 0
 //           5: 0 if this was the last packet, or 0x10 if there are more to read
 LONG SCSIWifi_receiveFrame(SCSIWIFIDevice device, UBYTE* packetBuffer, UWORD* packetSize);
+
+// Utility functions
+char *formatNewString(void *sysBase, const char *fmt, ...);
+void freeString(void *sysBase, char* string);
 
 
 #endif
