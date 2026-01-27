@@ -1,11 +1,10 @@
 /*
- * SCSI DaynaPORT Device (scsidayna.device) by RobSmithDev 
+ * SCSI DaynaPORT Device (scsidayna.device) Copyright (C) 2024-2026 RobSmithDev 
  *
- * based LARGELY on the MNT ZZ9000 Network Driver
- * Copyright (C) 2016-2019, Lukas F. Hartmann <lukas@mntre.com>
- *                          MNT Research GmbH, Berlin
- *                          https://mntre.com
- * Copyright (C) 2018 Henryk Richter <henryk.richter@gmx.net>
+ *
+ * Originally based on the MNT ZZ9000 Network Driver Copyright (C) 2016-2023, Lukas F. Hartmann <lukas@mntre.com>
+ *          which was Based on code copyright (C) 2018 Henryk Richter <henryk.richter@gmx.net>
+ * Released under GPLv3+ with permission.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  * GNU General Public License v3.0 or later
@@ -13,15 +12,6 @@
  * https://spdx.org/licenses/GPL-3.0-or-later.html
  */
 
-/*
-  device.h
-
-  (C) 2018 Henryk Richter <henryk.richter@gmx.net>
-
-  Device Functions and Definitions
-
-
-*/
 #ifndef _INC_DEVICE_H
 #define _INC_DEVICE_H
 
@@ -49,16 +39,15 @@ struct devbase {
 	struct Library *db_UtilityBase;
 	struct Sana2DeviceStats db_DevStats;
 	
-	struct Hook *db_logHook;  
+	BPTR db_debugConsole;  // I couldnt get any form of S2_SANA2HOOK working	
 	BOOL db_decrementCountOnFail;
-	
-	SHORT scsi_deviceID;                     // SCSI ID (0-7)
-	
-    STRPTR db_pendingOpenMsg;
-
+		
 	volatile USHORT db_online;
 	volatile USHORT db_currentWifiState;   // the *actual* online state
-
+	USHORT db_amigaNetMode;
+	USHORT db_maxPacketsSize;		// Maximum size of packet data (multiple packets)
+	USHORT db_maxPackets;			// Maximum number of supported packets per call
+	
     // SCSI device (in the main task)
 	void* db_scsiSettings;    // A pointer to a ScsiDaynaSettings struct  
 	struct List db_ReadList;

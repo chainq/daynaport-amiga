@@ -1,15 +1,10 @@
 /*
- * SCSI DaynaPORT Device (scsidayna.device) by RobSmithDev 
+ * SCSI DaynaPORT Device (scsidayna.device) Copyright (C) 2024-2026 RobSmithDev 
  *
- * based LARGELY on the MNT ZZ9000 Network Driver
- * Copyright (C) 2016-2023, Lukas F. Hartmann <lukas@mntre.com>
- *                          MNT Research GmbH, Berlin
- *                          https://mntre.com
  *
- * Based on code copyright (C) 2018 Henryk Richter <henryk.richter@gmx.net>
+ * Originally based on the MNT ZZ9000 Network Driver Copyright (C) 2016-2023, Lukas F. Hartmann <lukas@mntre.com>
+ *          which was Based on code copyright (C) 2018 Henryk Richter <henryk.richter@gmx.net>
  * Released under GPLv3+ with permission.
- *
- * More Info: https://mntre.com/zz9000
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  * GNU General Public License v3.0 or later
@@ -40,34 +35,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include "debug.h"
+#include "sana2.h"
 
 
 #ifdef HAVE_VERSION_H
 #include "version.h"
 #endif
-/* NSD support is optional */
-#ifdef NEWSTYLE
-#include <devices/newstyle.h>
-#endif /* NEWSTYLE */
-#ifdef DEVICES_NEWSTYLE_H
 
-const UWORD dev_supportedcmds[] = { NSCMD_DEVICEQUERY, CMD_READ, CMD_WRITE,0 };
-
-const struct NSDeviceQueryResult NSDQueryAnswer = {
-	0,
-	16, /* up to SupportedCommands (inclusive) TODO: correct number */
-	NSDEVTYPE_SANA2, /* device type */
-	0,  /* subtype */
-	(UWORD*)dev_supportedcmds
-};
-#endif /* DEVICES_NEWSTYLE_H */
-
+#include "newstyle.h"
 #include "device.h"
 #include "macros.h"
 
+const UWORD dev_supportedcmds[] = { NSCMD_DEVICEQUERY, CMD_READ, CMD_WRITE, /*S2_SANA2HOOK, */S2_GETGLOBALSTATS, S2_BROADCAST, CMD_WRITE, S2_ONEVENT, S2_READORPHAN, S2_ONLINE, S2_OFFLINE, S2_GETSTATIONADDRESS, S2_DEVICEQUERY, S2_GETSPECIALSTATS, 0 };
+
+
+#include <proto/exec.h>
+#include <proto/dos.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 __saveds void frame_proc();
-char *frame_proc_name = "SCSIDaynaPacketTask";
+char *frame_proc_name = "AmigaNetPacketScheduler";
 
 static UBYTE HW_MAC[] = {0x00,0x00,0x00,0x00,0x00,0x00};
 
@@ -80,20 +68,41 @@ struct ProcInit {
 
 // Free's anything left after init
 void freeInit(DEVBASEP) {
-	if (db->db_pendingOpenMsg) {
-		freeString(db->db_SysBase, db->db_pendingOpenMsg);
-		db->db_pendingOpenMsg = NULL;
-	}
 	if (db->db_scsiSettings) FreeVec(db->db_scsiSettings); 
 	db->db_scsiSettings = NULL;
+	if (db->db_debugConsole) Close(db->db_debugConsole);
+	db->db_debugConsole = 0;
 	if (DOSBase) CloseLibrary(DOSBase); 
 	DOSBase = NULL;
 	if (UtilityBase) CloseLibrary(UtilityBase); 
 	UtilityBase = NULL;
 }
 
-
 void DevTermIO( DEVBASEP, struct IORequest *ioreq );
+
+// Simple logging to console window
+void logMessage(struct devbase* db, const char *message) {
+	struct ScsiDaynaSettings* settings = (struct ScsiDaynaSettings*)db->db_scsiSettings;
+	if (!settings->debug) return;
+	if (!db->db_debugConsole) db->db_debugConsole = Open("CON:10/10/620/100/SCSIDayna Debug Output (RobSmithDev)/AUTO/CLOSE/WAIT", MODE_NEWFILE);
+    if (db->db_debugConsole) {
+		FPuts(db->db_debugConsole, message);
+		FPuts(db->db_debugConsole, "\n");
+	}
+}
+
+// Formatted logging to console window
+static const UWORD stuffChar[] = {0x16c0, 0x4e75};
+void logMessagef(struct devbase* db, const char *messageFormat, ...) {
+	struct ScsiDaynaSettings* settings = (struct ScsiDaynaSettings*)db->db_scsiSettings;
+	if (!settings->debug) return;
+	char buf[100];
+    va_list args;
+    va_start(args, messageFormat);	 
+    RawDoFmt((STRPTR)messageFormat, (APTR)args, (void (*)(void))stuffChar, buf);
+	va_end(args);
+	logMessage(db, buf);
+}
 
 // Simple device init that saves all the real errors until later
 __saveds struct Device *DevInit( ASMR(d0) DEVBASEP ASMREG(d0), ASMR(a0) BPTR seglist ASMREG(a0), ASMR(a6) struct Library *_SysBase  ASMREG(a6) ) {	
@@ -103,11 +112,9 @@ __saveds struct Device *DevInit( ASMR(d0) DEVBASEP ASMREG(d0), ASMR(a0) BPTR seg
 	db->db_UtilityBase = NULL;
 	db->db_scsiSettings = NULL;
 	db->db_online = 0;
-	db->db_pendingOpenMsg = NULL;	
 	db->db_decrementCountOnFail = 0;
-
-	volatile struct List db_EventList;
-	struct SignalSemaphore db_EventListSem;     	
+	db->db_debugConsole = 0;
+	db->db_amigaNetMode = 0;
   
 	DOSBase = OpenLibrary("dos.library", 36);
 	if (!DOSBase) {
@@ -134,15 +141,32 @@ __saveds struct Device *DevInit( ASMR(d0) DEVBASEP ASMREG(d0), ASMR(a0) BPTR seg
 	if (SCSIWifi_loadSettings((void*)UtilityBase, (void*)DOSBase, settings))
 		D(("scsidayna: settings loaded")); 
 	else D(("scsidayna: Invalid or missing settings file, reverting to defaults\n"));
+	
+	// Log config on startup
+	if (settings->debug) {
+		logMessage(db, "Loaded Configuration:");
+		logMessagef(db, "	SCSI Device: %s", settings->deviceName);
+		if ((settings->deviceID<0) || (settings->deviceID>7)) logMessage(db, "	Unit ID: Auto Detect"); else logMessagef(db, "	Unit ID: %ld", settings->deviceID);
+		logMessagef(db, "	Priority: %ld", settings->taskPriority);
+		logMessagef(db, "	Max Transfer Size: %ld", settings->maxDataSize);
+		logMessagef(db, "	Mode: %ld", settings->scsiMode);
+		if (settings->autoConnect) {
+			logMessagef(db, "	Auto Connect Wifi: Yes");
+			logMessagef(db, "	SSID: %s", settings->ssid);
+			logMessagef(db, "	Key: %s", settings->key);
+		} else {
+			logMessagef(db, "	Auto Connect Wifi: No");
+		}
+	}
   
 	return (struct Device*)db;
 }
 
+// Return an error and clean up
 LONG returnError(struct devbase* db, struct IOSana2Req *ioreq, LONG errorCode) {
 	ioreq->ios2_Req.io_Error = errorCode; 
 	ioreq->ios2_Req.io_Unit = (struct Unit *)0;   
-	ioreq->ios2_Req.io_Device = (struct Device *)0;
-	D((db->db_pendingOpenMsg));
+	ioreq->ios2_Req.io_Device = (struct Device *)0;	
 	if (db->db_decrementCountOnFail) {
 		db->db_decrementCountOnFail = 0;
 		db->db_Lib.lib_OpenCnt--;
@@ -150,55 +174,19 @@ LONG returnError(struct devbase* db, struct IOSana2Req *ioreq, LONG errorCode) {
 	return errorCode;
 }
 
-/*
-void delay_s(struct devbase* db, ULONG seconds)
-{
-    struct MsgPort *port = CreateMsgPort();
-    if (!port) return;
-
-    struct timerequest *tr = (struct timerequest *)
-        CreateIORequest(port, sizeof(struct timerequest));
-    if (!tr) {
-        DeleteMsgPort(port);
-        return;
-    }
-
-    if (OpenDevice("timer.device", UNIT_MICROHZ, (struct IORequest *)tr, 0) == 0) {
-        tr->tr_node.io_Command = TR_ADDREQUEST;
-        tr->tr_time.tv_secs  = seconds;
-        tr->tr_time.tv_micro = 0;
-
-        DoIO((struct IORequest *)tr);  // this blocks (sleep)
-        CloseDevice((struct IORequest *)tr);
-    }
-
-    DeleteIORequest((struct IORequest *)tr);
-    DeleteMsgPort(port);
-}*/
-
+// Device open!
 __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) ULONG unit ASMREG(d0), ASMR(d1) ULONG flags ASMREG(d1), ASMR(a6) DEVBASEP ASMREG(a6) ) {		
 	struct ScsiDaynaSettings* settings = (struct ScsiDaynaSettings*)db->db_scsiSettings;
 	db->db_decrementCountOnFail = 0;		
-	
-	/*D(("Looking for Log JHook"));
-	delay_s(db,1);
-	db->db_logHook = (struct Hook*)GetTagData(S2_Log, 0, (struct TagItem *)ioreq->ios2_BufferManagement);
-	
-	if (db->db_logHook) {
-		D(("LOG HOOK FOUND"));
-	} else {
-		D(("LOG HOOK NOT FOUND"));
-	}
-	delay_s(db,1);*/
-	
+			
     // promiscuous mode not supported
 	if ((flags & SANA2OPF_PROM) && (unit)) {
-		db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: SANA2OPF_PROM not supported on unit id %ld\n", unit);
+		logMessagef(db, "DevOpen: SANA2OPF_PROM not supported on unit id %ld", unit);
 		return returnError(db, ioreq, IOERR_OPENFAIL);
 	}	
 
 	if (strlen(settings->deviceName)<1) {
-		db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: SCSI device name not set");
+		logMessage(db, "DevOpen: CSI device name not set");
 		return returnError(db, ioreq, IOERR_OPENFAIL);
 	}
 		
@@ -216,58 +204,86 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 		enum SCSIWifi_OpenResult scsiResult;
 	
 		// Open it
-		if ((settings->deviceID<0) || (settings->deviceID>7)) {
+		if ((settings->deviceID<0) || (settings->deviceID>7)) {			
 			D(("scsidayna: Searching for DaynaPORT Device to Configure\n"));
 			// Highly likely it will be on 4 as its in the example so start there!
 			for (USHORT deviceID=4; deviceID<4+8; deviceID++) {
 				openData.deviceID = deviceID & 7;  
 				D(("scsidayna: Searching on DeviceID %ld\n", openData.deviceID));
 				wifiDevice = SCSIWifi_open(&openData, &scsiResult);
-				if (wifiDevice) break;
+				if (wifiDevice) {
+					settings->deviceID = openData.deviceID;
+					logMessagef(db, "DevOpen: Detected Network Device on Unit %ld", openData.deviceID );
+					break;
+				}
 			}
-		} else {
-			D(("scsidayna: Opening Device to Configure\n"));
+		} else {			
 			wifiDevice = SCSIWifi_open(&openData, &scsiResult);
 		}
-		
-		db->scsi_deviceID = openData.deviceID;		
-	
+			
 		if (!wifiDevice) {
 			switch (scsiResult) {
-				case sworOpenDeviceFailed: db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Failed to open SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;  
-				case sworOutOfMem:  db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Out of memory opening SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
-				case sworInquireFail:      db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Inquiry of SCSI device failed \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
-				case sworNotDaynaDevice:   db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Device is not a DaynaPort SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
-				default: db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Unknown error occured opening device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+				case sworOpenDeviceFailed: 	logMessagef(db, "DevOpen: Failed to open SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;  
+				case sworOutOfMem:  		logMessagef(db, "DevOpen: Out of memory opening SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+				case sworInquireFail:      	logMessagef(db, "DevOpen: Inquiry of SCSI device failed \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+				case sworNotDaynaDevice:   	logMessagef(db, "DevOpen: Device is not a DaynaPort SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+				default: logMessagef(db, "DevOpen:  Unknown error occured opening device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
 			}
 			return returnError(db, ioreq, IOERR_OPENFAIL);
 		}
-		D(("scsidayna: successfully opened. Fetching MAC\n"));
 		
-		// Device open. Fetch MAC address
-		struct SCSIWifi_MACAddress macAddress;
-		if (!SCSIWifi_getMACAddress(wifiDevice, &macAddress)) {
-			db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Failed to fetch hardware MAC address \"%s\" ID %ld\n", settings->deviceName, settings->deviceID);
-			SCSIWifi_close(wifiDevice);
-			return returnError(db, ioreq, IOERR_OPENFAIL);
-		}
-		
-		// Take a copy of the MAC Address
-		memcpy(HW_MAC, macAddress.address, 6);
-		D(("scsidayna: MAC Address stored, checking WIFI status\n"));
+		if (scsiResult == sworGreat) {
+			db->db_amigaNetMode = 1;
+			logMessagef(db, "DevOpen: AmigaNET Interface Detected"); 
+			// Device open. Fetch MAC address
+			struct SCSIWifi_DeviceInfo devInfo;
+			if (!SCSIWifi_getDeviceInfo(wifiDevice, &devInfo)) {
+				logMessagef(db, "DevOpen: Failed to fetch device info from Device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); 
+				SCSIWifi_close(wifiDevice);
+				return returnError(db, ioreq, IOERR_OPENFAIL);
+			}
+			// Take a copy of the MAC Address
+			memcpy(HW_MAC, devInfo.macAddress, 6);
+			db->db_maxPacketsSize = devInfo.maxPacketsSize;
+			db->db_maxPackets = devInfo.maxPackets;
+			D(("scsidayna: MAC Address stored, checking WIFI status\n"));
+			logMessagef(db, "DevOpen: Max Data Transfer Size: %ld  (limited to %ld), Max Packets: %ld",db->db_maxPacketsSize, settings->maxDataSize, db->db_maxPackets);
+			if (db->db_maxPacketsSize > settings->maxDataSize) db->db_maxPacketsSize = settings->maxDataSize;
+			// Ensure db->db_maxPacketsSize is even
+			if (db->db_maxPacketsSize&1) db->db_maxPacketsSize++;
+		} else {
+			db->db_amigaNetMode = 0;
+			db->db_maxPacketsSize = 0;
+			db->db_maxPackets = 0;
+			logMessagef(db, "DevOpen: Legacy Daynaport Interface Detected (Upgrade SCSI Firmware)"); 
+			// Device open. Fetch MAC address
+			struct SCSIWifi_MACAddress macAddress;
+			if (!SCSIWifi_getMACAddress(wifiDevice, &macAddress)) {
+				logMessagef(db, "DevOpen: Failed to fetch MAC Address from Device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); 
+				SCSIWifi_close(wifiDevice);
+				return returnError(db, ioreq, IOERR_OPENFAIL);
+			}
+			// Take a copy of the MAC Address
+			D(("scsidayna: MAC Address stored, checking WIFI status\n"));
+			memcpy(HW_MAC, macAddress.address, 6);
+		}				
+		logMessagef(db, "DevOpen: MAC Address %02lx:%02lx:%02lx:%02lx:%02lx:%02lx",HW_MAC[0],HW_MAC[1],HW_MAC[2],HW_MAC[3],HW_MAC[4],HW_MAC[5]); 
 			
+		
 		// Should we be attempting to connect to wifi?
 		if ((settings->autoConnect) && (strlen(settings->ssid))) {
 			// Fetch what the current network is
 			struct SCSIWifi_NetworkEntry currentNetwork;
 			if (!SCSIWifi_getNetwork(wifiDevice, &currentNetwork)) memset(&currentNetwork, 0, sizeof(struct SCSIWifi_NetworkEntry));
 			if (strcmp(currentNetwork.ssid, settings->ssid) == 0) {
+				logMessage(db, "DevOpen: Already Connected to Specified WIFI Network"); 
 				D(("scsidayna: Already connected to requested WIFI network\n"));
 			} else {
 				struct SCSIWifi_JoinRequest request;
 				strcpy(request.ssid, settings->ssid);
 				strcpy(request.key, settings->key);
 				SCSIWifi_joinNetwork(wifiDevice, &request);
+				logMessage(db, "DevOpen: Requesting to Join WIFI Network"); 
 				D(("scsidayna: Attempting to connect to WIFI network\n"));     
 			}
 		}
@@ -308,16 +324,16 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 					WaitPort(port);
 
 					if (init.error) {
-						db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna:process startup error");
+						logMessagef(db,"DevOpen: Process startup error"); 
 						return returnError(db, ioreq, IOERR_OPENFAIL);
 					}
 				} else {
-					db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna:couldnt create process");
+					logMessagef(db,"DevOpen: Couldn't create process"); 
 					return returnError(db, ioreq, IOERR_OPENFAIL);
 				}
 				DeleteMsgPort(port);
 			} else {
-				db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna:failed to create message port");
+				logMessagef(db,"DevOpen: Failed to create message port"); 
 				return returnError(db, ioreq, IOERR_OPENFAIL);
 			}
 		}
@@ -327,6 +343,7 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 	db->db_Lib.lib_Flags &= ~LIBF_DELEXP;
 	
 	D(("scsidayna: DevOpen\n"));
+	logMessage(db, "DevOpen: Ready"); 
 	return 0;
 }
 
@@ -373,45 +390,72 @@ __saveds BPTR DevExpunge( ASMR(a6) DEVBASEP ASMREG(a6) ) {
 	return seglist;
 }
 
-__saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6) DEVBASEP ASMREG(a6) ) {
-	ULONG unit = (ULONG)ioreq->ios2_Req.io_Unit;
-	int mtu;
-
+__saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6) DEVBASEP ASMREG(a6) ) {    
 	ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
 	ioreq->ios2_Req.io_Error = S2ERR_NO_ERROR;
 	ioreq->ios2_WireError = S2WERR_GENERIC_ERROR;
 
 	switch( ioreq->ios2_Req.io_Command ) {
-		case CMD_READ:
-			if (ioreq->ios2_BufferManagement == NULL) {
-				ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
-				ioreq->ios2_WireError = S2WERR_BUFF_ERROR;
-			} else if (!db->db_currentWifiState) {
-				ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
-				ioreq->ios2_WireError = S2WERR_UNIT_OFFLINE;
-			} else {
-				ioreq->ios2_Req.io_Flags &= ~SANA2IOF_QUICK;
-				ObtainSemaphore(&db->db_ReadListSem);
-				AddTail((struct List*)&db->db_ReadList, (struct Node*)ioreq);
-				ReleaseSemaphore(&db->db_ReadListSem);
-				ioreq = NULL;
+	case NSCMD_DEVICEQUERY: 
+		{
+			D(("NSCMD_DEVICEQUERY"));
+			struct IOStdReq *ioreq2 = (struct IOStdReq *)ioreq;
+			ULONG size = sizeof(struct NSDeviceQueryResult);
+			if((ioreq2->io_Data == NULL) || (ioreq2->io_Length < size)) {
+				ioreq2->io_Error = IOERR_BADLENGTH;
 			}
+			else {
+				struct NSDeviceQueryResult *info = ioreq2->io_Data;
+				ioreq2->io_Error = 0;
+				ioreq2->io_Actual = size;
+				info->SizeAvailable = size;
+				info->DevQueryFormat = 0;
+				info->DeviceType = NSDEVTYPE_SANA2;
+				info->DeviceSubType = 0;
+				info->SupportedCommands = (APTR)dev_supportedcmds;
+			}
+
+			if (!(ioreq2->io_Flags & IOF_QUICK)) {
+				ioreq2->io_Message.mn_Node.ln_Type = NT_MESSAGE;
+				ReplyMsg((struct Message *)ioreq2);
+			}
+			else {
+				/* otherwise just mark it as done */
+				ioreq2->io_Message.mn_Node.ln_Type = NT_REPLYMSG;
+			}		
+			return;
+		}
+		break;
+		
+	case CMD_READ:
+		if (ioreq->ios2_BufferManagement == NULL) {
+			ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+			ioreq->ios2_WireError = S2WERR_BUFF_ERROR;
+		} else if (!db->db_currentWifiState) {
+			ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+			ioreq->ios2_WireError = S2WERR_UNIT_OFFLINE;
+		} else {
+			ioreq->ios2_Req.io_Flags &= ~SANA2IOF_QUICK;
+			ObtainSemaphore(&db->db_ReadListSem);
+			AddTail((struct List*)&db->db_ReadList, (struct Node*)ioreq);
+			ReleaseSemaphore(&db->db_ReadListSem);
+			ioreq = NULL;
+		}
 		break;
 
 	case S2_GETGLOBALSTATS:
 		memcpy(ioreq->ios2_StatData, &db->db_DevStats, sizeof(struct Sana2DeviceStats));
 		break;
 
-	case S2_BROADCAST:   /* set broadcast addr: ff:ff:ff:ff:ff:ff */
+	case S2_BROADCAST:   
 		if (ioreq->ios2_DstAddr) {
-			memset(ioreq->ios2_DstAddr, 0xff, HW_ADDRFIELDSIZE);
+			memset(ioreq->ios2_DstAddr, 0xFF, HW_ADDRFIELDSIZE);
 		} else {
 			D(("bcast: invalid dst addr\n"));
 			ioreq->ios2_Req.io_Error = S2ERR_BAD_ADDRESS;
 			ioreq->ios2_WireError = S2WERR_BUFF_ERROR;
 		}
-		// fall through!
-	
+		// fall through!	
 	case CMD_WRITE: 
 		if (ioreq->ios2_BufferManagement == NULL) {
 			ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
@@ -487,8 +531,7 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 		memcpy(ioreq->ios2_DstAddr, HW_MAC, HW_ADDRFIELDSIZE); /* default */
 		break;
 		
-	case S2_DEVICEQUERY:
-		{
+	case S2_DEVICEQUERY: {
 			struct Sana2DeviceQuery *devquery;
 			devquery = ioreq->ios2_StatData;
 			devquery->DevQueryFormat = 0;        // this is format 0
@@ -507,10 +550,9 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 		  s2ssh->RecordCountSupplied = 0;
 		}
 		break;
-	/*		
+			/*
 	case S2_SANA2HOOK:
-		{
-			D(("Debug Hook Called"));
+		{			
 			struct Sana2Hook *s2h = (struct Sana2Hook *)ioreq->ios2_Data;
 			db->db_logHook = NULL;
 			if (s2h && s2h->s2h_Methods) {
@@ -518,37 +560,19 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 				struct TagItem *tag;
 
 				while ((tag = NextTagItem(&state))) {
+					D(("Tag %d", tag->ti_Tag));
 					if (tag->ti_Tag == S2_Log) {
 						db->db_logHook = &s2h->s2h_Hook;
-						D(("Debug Hook Found"));
 						break;
 					}
 				}
 			}
 			
-			
-			struct S2LogMessage msg;
-			msg.s2lm_Size = sizeof(msg);
-			msg.s2lm_Priority = S2LOG_Warning;
-			msg.s2lm_Name = "MOO";
-			msg.s2lm_Message = "Testing 1 2 3";
-			
-			//if (db->db_logHook) CallHookPkt(db->db_logHook, db, &msg);
-			D(("Called Debug Hook"));
-			db->db_logHook = NULL;
-			
-			// Any errors need logging?
-			if (db->db_pendingOpenMsg && db->db_logHook) {
-				//CallHookPkt(db->db_logHook, db, db->db_pendingOpenMsg);
-				freeString(db->db_SysBase, db->db_pendingOpenMsg);
-				db->db_pendingOpenMsg = NULL;
-			}
-
 			ioreq->ios2_Req.io_Error = 0;
 			ReplyMsg((struct Message *)ioreq);
 			return;
 		}		
-			*/
+*/			
 	default:
 		{
 			ioreq->ios2_Req.io_Error = S2ERR_NOT_SUPPORTED;
@@ -708,6 +732,52 @@ ULONG read_frame(DEVBASEP, struct IOSana2Req *req, UBYTE *frm, USHORT packetSize
 	return 1;
 }
 
+// Receive a packet
+ULONG receivePacket(DEVBASEP, UBYTE* packet, USHORT packetSize, struct IOSana2Req *req) {	
+	ULONG datasize;
+	BYTE *frame_ptr;
+	BOOL broadcast;
+	ULONG res = 0;
+
+	req->ios2_PacketType = ((USHORT)packet[12]<<8)|((USHORT)packet[13]);
+
+	if (req->ios2_Req.io_Flags & SANA2IOF_RAW) {
+		frame_ptr = packet;
+		datasize = packetSize;
+		req->ios2_Req.io_Flags = SANA2IOF_RAW;
+	} else {
+		frame_ptr = packet+HW_ETH_HDR_SIZE;
+		datasize = packetSize-HW_ETH_HDR_SIZE;
+		req->ios2_Req.io_Flags = 0;
+	}
+	req->ios2_DataLength = datasize;
+	
+	// copy frame to device user (probably tcp/ip system)
+	struct BufferManagement *bm = (struct BufferManagement *)req->ios2_BufferManagement;
+	if (!(*bm->bm_CopyToBuffer)(req->ios2_Data, frame_ptr, datasize)) {
+		req->ios2_Req.io_Error = S2ERR_SOFTWARE;
+		req->ios2_WireError = S2WERR_BUFF_ERROR;
+		DoEvent(db, S2EVENT_ERROR | S2EVENT_BUFF | S2EVENT_SOFTWARE);
+		return 0;
+	}
+  
+	req->ios2_Req.io_Error = req->ios2_WireError = 0;
+
+	memcpy(req->ios2_SrcAddr, packet+6, HW_ADDRFIELDSIZE);
+	memcpy(req->ios2_DstAddr, packet, HW_ADDRFIELDSIZE);  
+
+	broadcast = TRUE;
+	for (int i=0; i<HW_ADDRFIELDSIZE; i++) {
+		if (packet[i] != 0xff) {
+			broadcast = FALSE;
+			break;
+		}
+	}
+	
+	if (broadcast) req->ios2_Req.io_Flags |= SANA2IOF_BCAST;
+	return 1;
+}
+
 
 void rejectAllPackets(DEVBASEP) {
   struct IOSana2Req *ior;
@@ -764,7 +834,12 @@ __saveds void frame_proc() {
 	ObtainSemaphore(&db->db_ProcSem);
   
 	// Temporary packet store
-	char* packetData = AllocVec(SCSIWIFI_PACKET_MAX_SIZE + 6, MEMF_PUBLIC);	
+	UBYTE* packetData;
+	struct IOSana2Req** pendingSends = NULL;
+	if (db->db_amigaNetMode) {	
+		 packetData = AllocVec(db->db_maxPacketsSize + 2, MEMF_PUBLIC);	
+		 pendingSends = (struct IOSana2Req**)AllocVec(db->db_maxPackets * sizeof(struct IOSana2Req*), MEMF_PUBLIC);	
+	} else packetData = AllocVec(SCSIWIFI_PACKET_MAX_SIZE + 6, MEMF_PUBLIC);	
 	
 	struct MsgPort timerPort;
 	timerPort.mp_Node.ln_Pri = 0;                       
@@ -788,11 +863,12 @@ __saveds void frame_proc() {
 	openData.utilityBase = (void*)UtilityBase;
 	openData.dosBase = (void*)DOSBase;
 	openData.deviceDriverName = settings->deviceName;
-	openData.deviceID = db->scsi_deviceID;
+	openData.deviceID = settings->deviceID;
 	openData.scsiMode = settings->scsiMode;
 	enum SCSIWifi_OpenResult scsiResult;
 	
 	D(("scsidayna: Opening SCSI Device\n"));
+	logMessagef(db,"PacketServer: Starting Wifi Device"); 
 	scsiDevice = SCSIWifi_open(&openData, &scsiResult);
 
 	if ((!packetData) || (errorDevOpen !=0) || (((char)timerPort.mp_SigBit) < 0) || (!time_req) | (!scsiDevice)) {
@@ -802,25 +878,24 @@ __saveds void frame_proc() {
 		
 		if (!scsiDevice) {
 			switch (scsiResult) {
-				case sworOpenDeviceFailed: db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Failed to open SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;  
-				case sworOutOfMem:  	   db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Out of memory opening SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
-				case sworInquireFail:      db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Inquiry of SCSI device failed \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
-				case sworNotDaynaDevice:   db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Device is not a DaynaPort SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
-				default: db->db_pendingOpenMsg = formatNewString(db->db_SysBase, "scsidayna: Unknown error occured opening device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
-			}
-			D((db->db_pendingOpenMsg)); 
+				case sworOpenDeviceFailed: logMessagef(db,"PacketServer: Failed to open SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;  
+				case sworOutOfMem:  	   logMessagef(db,"PacketServer: Out of memory opening SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+				case sworInquireFail:      logMessagef(db,"PacketServer: Inquiry of SCSI device failed \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+				case sworNotDaynaDevice:   logMessagef(db,"PacketServer: Device is not a DaynaPort SCSI device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+				default: logMessagef(db,"PacketServer: Unknown error occured opening device \"%s\" ID %ld\n", settings->deviceName, settings->deviceID); break;
+			}			
 		} else {
 			SCSIWifi_close(scsiDevice);
 			scsiDevice =0;
 		}
 		
 		if (errorDevOpen != 0) {
-			if (db->db_logHook) CallHookPkt(db->db_logHook, db, "scsidayna_task: Out of memory [3]");
+			logMessage(db,"PacketServer: Out of memory [3]");
 			D(("scsidayna_task: Out of memory [3]\n")); 
 		} else {			
 			CloseDevice((struct IORequest *)time_req);
 			if (!time_req) {
-				if (db->db_logHook) CallHookPkt(db->db_logHook, db, "scsidayna_task: Out of memory [2]");
+				logMessage(db,"PacketServer: Out of memory [2]");
 				D(("scsidayna_task: Out of memory [2]\n")); 			
 			} else {
 				DeleteIORequest((struct IORequest *)time_req);
@@ -828,15 +903,10 @@ __saveds void frame_proc() {
 		}
 		
 		if (!packetData) {
-			if (db->db_logHook) CallHookPkt(db->db_logHook, db, "scsidayna_task: Out of memory [1]");
+			logMessage(db,"PacketServer: Out of memory [1]");
 			D(("scsidayna_task: Out of memory [1]\n")); 
 		} else FreeVec(packetData);
-		
-		if (!scsiDevice) {
-			if (db->db_logHook) CallHookPkt(db->db_logHook, db, "scsidayna_task: scsi device not open");
-			D(("scsidayna_task: scsi device not open\n")); 
-		}
-		
+				
 		if (((char)timerPort.mp_SigBit)>=0) FreeSignal(timerPort.mp_SigBit);
 		ReplyMsg((struct Message*)init);
 		Forbid();
@@ -852,8 +922,7 @@ __saveds void frame_proc() {
 	ReplyMsg((struct Message*)init);
 	unsigned long timerSignalMask = (1UL << timerPort.mp_SigBit);
 
-	time_req->tr_node.io_Command = TR_ADDREQUEST;
-	time_req->tr_time.tv_secs = 0;
+	time_req->tr_node.io_Command = TR_ADDREQUEST; time_req->tr_time.tv_secs = 0;
 
 	ULONG recv = 0;
 	USHORT currentWifiState = 0;	
@@ -877,10 +946,12 @@ __saveds void frame_proc() {
 			struct SCSIWifi_NetworkEntry wifi;
 			if (SCSIWifi_getNetwork(scsiDevice, &wifi)) {
 				if (wifi.rssi == 0) {
+					logMessage(db,"PacketServer: Wifi not connected");
 					D(("scsidayna_task: WIFI not connected\n"));
 					lastWifiStatus = 0;
 				} else {
 					lastWifiStatus = 1;
+					logMessagef(db,"PacketServer: Wifi Connected, Signal Strength: %ld dB\n", wifi.rssi);
 					D(("scsidayna_task: WIFI connected with strength %ld dB\n", wifi.rssi));
 				}
 			}
@@ -903,45 +974,143 @@ __saveds void frame_proc() {
 			UBYTE morePackets = 0;
 			USHORT counter = 0;   
 			do {
-				USHORT packetSize = SCSIWIFI_PACKET_MAX_SIZE + 6;
-				if (SCSIWifi_receiveFrame(scsiDevice, packetData, &packetSize)) {    
-					morePackets = packetData[5];
-					db->db_DevStats.PacketsReceived++;
-
-					if (packetSize > 6) {
-						USHORT packet_type = ((USHORT)packetData[18]<<8)|((USHORT)packetData[19]);   
-
-						ObtainSemaphore(&db->db_ReadListSem);
-						struct IOSana2Req *ior = NULL;						
-						for (ior = (struct IOSana2Req *)db->db_ReadList.lh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ; ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
-							if (ior->ios2_PacketType == packet_type) {
-								Remove((struct Node*)ior);
-								read_frame(db, ior, packetData, packetSize);        
-								DevTermIO(db, (struct IORequest *)ior);
-								counter++;
-								ior = NULL;
+				
+				if (db->db_amigaNetMode) {					
+					ULONG dataReceived = SCSIWifi_AmigaNetRecvFrames(scsiDevice, packetData,db->db_maxPacketsSize);					
+					if (dataReceived<4) {
+						morePackets = 0;
+						D(("RECV FAILED\n"));
+						logMessage(db,"PacketServer: Warning - Batch Recv Failed from Device");
+						DoEvent(db, S2EVENT_ERROR | S2EVENT_HARDWARE | S2EVENT_RX);
+					} else {
+						USHORT numPackets = ((USHORT)packetData[0] << 8) | (USHORT)packetData[1];						
+						if (packetData[2]) morePackets=1; else morePackets=0;						
+						UBYTE* dataStart = &packetData[4];
+						dataReceived -= 4;
+												
+						// Receive packets
+						while (numPackets>0) {
+							if (dataReceived<4) {
+								logMessage(db,"PacketServer: Buffer underrun [1]");
 								break;
 							}
-						}
-						ReleaseSemaphore(&db->db_ReadListSem);
-						
-						// Nothing wanted it?
-						if (ior) {
-							db->db_DevStats.UnknownTypesReceived++;
-							ObtainSemaphore(&db->db_ReadOrphanListSem);
-							ior = (struct IOSana2Req *)RemHead((struct List*)&db->db_ReadOrphanList);
-							ReleaseSemaphore(&db->db_ReadOrphanListSem);
-							if (ior) {
-								read_frame(db, ior, packetData, packetSize);
-								DevTermIO(db, (struct IORequest *)ior);  
-								D(("Orphan Packet Picked Up (proto %lx) !\n", packet_type));
-							} 
-						}
-					}
+							const USHORT packetSize = ((USHORT)dataStart[0]  << 8) | (USHORT)dataStart[1];
+							dataStart+= 2;
+							dataReceived-=2;
+							
+							// Check packet has minimum size for Ethernet header
+							if (packetSize < 14) {
+								logMessage(db,"PacketServer: Warn - Packet too small");
+								dataStart += packetSize;
+								dataReceived -= packetSize;
+								numPackets--;
+								continue;
+							}
+							
+							const USHORT packetType = ((USHORT)dataStart[12] << 8)| ((USHORT)dataStart[13]);							
+							//logMessagef(db,"PacketServer: Received Packet type %lx received, size=%ld", packetType, packetSize);
+							
+							if (packetSize > dataReceived) {
+								logMessage(db,"PacketServer: Buffer underrun [2]");
+								break;
+							}
+							
+							ObtainSemaphore(&db->db_ReadListSem);							
+							struct IOSana2Req *ior = NULL;						
+							for (ior = (struct IOSana2Req *)db->db_ReadList.lh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ; ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
+								if (ior->ios2_PacketType == packetType) {
+									db->db_DevStats.PacketsReceived++;
+									Remove((struct Node*)ior);
+									receivePacket(db, dataStart, packetSize, ior);
+									DevTermIO(db, (struct IORequest *)ior);
+									counter++;
+									ior = NULL;
+									break;
+								}
+							}
+							ReleaseSemaphore(&db->db_ReadListSem);
+							
+							// Nothing wanted it?
+							if (ior) {			
+								db->db_DevStats.UnknownTypesReceived++;
+								ObtainSemaphore(&db->db_ReadOrphanListSem);
+								ior = (struct IOSana2Req *)RemHead((struct List*)&db->db_ReadOrphanList);
+								ReleaseSemaphore(&db->db_ReadOrphanListSem);
+
+								if (!ior) {
+									// No orphan buffer - signal problem
+									DoEvent(db, S2EVENT_BUFF | S2EVENT_RX);  // Signal BEFORE dropping        
+									// Very brief delay (1-2 ticks) to let RoadShow post a buffer
+									Delay(1);
+									// Try ONE more time
+									ObtainSemaphore(&db->db_ReadOrphanListSem);
+									ior = (struct IOSana2Req *)RemHead((struct List*)&db->db_ReadOrphanList);
+									ReleaseSemaphore(&db->db_ReadOrphanListSem);        
+									if (!ior) {
+										// Still no buffer - drop it
+										logMessagef(db,"PacketServer: Warn - Orphaned packet not picked up of type %lx", packetType);
+										db->db_DevStats.Overruns++;
+										DoEvent(db, S2EVENT_ERROR | S2EVENT_BUFF | S2EVENT_SOFTWARE | S2EVENT_RX);
+									} else {
+										//logMessagef(db, "PacketServer: Buffer arrived after signal - packet saved");
+										receivePacket(db, dataStart, packetSize, ior);
+										DevTermIO(db, (struct IORequest *)ior);
+									}
+								} else {
+									receivePacket(db, dataStart, packetSize, ior);
+									DevTermIO(db, (struct IORequest *)ior);  									
+									//logMessagef(db,"PacketServer: Warn - Orphaned packet picked up of type %lx", packetType);
+								} 								
+							}
+							
+							dataReceived -= packetSize;
+							
+							numPackets--;
+							dataStart += packetSize;
+						}						
+					}										
 				} else {
-					morePackets = 0;
-					D(("RECV FAILED\n"));
-					DoEvent(db, S2EVENT_ERROR | S2EVENT_HARDWARE | S2EVENT_RX);
+					USHORT packetSize = SCSIWifi_receiveFrame(scsiDevice, packetData, SCSIWIFI_PACKET_MAX_SIZE + 6);
+					if (packetSize) {    
+						morePackets = packetData[5];						
+
+						if (packetSize > 6) {
+							USHORT packet_type = ((USHORT)packetData[18]<<8)|((USHORT)packetData[19]);   
+
+							ObtainSemaphore(&db->db_ReadListSem);
+							struct IOSana2Req *ior = NULL;						
+							for (ior = (struct IOSana2Req *)db->db_ReadList.lh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ; ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
+								if (ior->ios2_PacketType == packet_type) {
+									db->db_DevStats.PacketsReceived++;
+									Remove((struct Node*)ior);
+									read_frame(db, ior, packetData, packetSize);        
+									DevTermIO(db, (struct IORequest *)ior);
+									counter++;
+									ior = NULL;
+									break;
+								}
+							}
+							ReleaseSemaphore(&db->db_ReadListSem);
+							
+							// Nothing wanted it?
+							if (ior) {
+								db->db_DevStats.UnknownTypesReceived++;
+								ObtainSemaphore(&db->db_ReadOrphanListSem);
+								ior = (struct IOSana2Req *)RemHead((struct List*)&db->db_ReadOrphanList);
+								ReleaseSemaphore(&db->db_ReadOrphanListSem);
+								if (ior) {
+									read_frame(db, ior, packetData, packetSize);
+									DevTermIO(db, (struct IORequest *)ior);  
+									D(("Orphan Packet Picked Up (proto %lx) !\n", packet_type));
+								} 
+							}
+						}
+					} else {
+						morePackets = 0;
+						D(("RECV FAILED\n"));
+						logMessage(db,"PacketServer: Warning - Recv Failed from Device");
+						DoEvent(db, S2EVENT_ERROR | S2EVENT_HARDWARE | S2EVENT_RX);
+					}
 				}
 
 				recv = SetSignal(0, SIGBREAKF_CTRL_C|SIGBREAKF_CTRL_F);
@@ -950,20 +1119,115 @@ __saveds void frame_proc() {
 
 			// Prevent delaying if there was data incoming
 			if (counter >= 2) morePackets = 1;
+						
+			if (db->db_amigaNetMode) {
+				// Batch packet sending
+				counter = 0;
+				UBYTE* dataOut = &packetData[2];  // 2 bytes header at the front
+				USHORT spaceRemaining = db->db_maxPacketsSize - 2;
+				struct IOSana2Req** pendingSendsSave = pendingSends;
+				struct IOSana2Req *nextwrite;
+				// Collect packets until not enough data space or too many
+				ObtainSemaphore(&db->db_WriteListSem);
+				struct IOSana2Req *ior = (struct IOSana2Req *)db->db_WriteList.lh_Head;
+			    while ((nextwrite = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) != NULL) {
+					USHORT sz = ior->ios2_DataLength;					
+					UBYTE* rewind = dataOut;
+					const USHORT rewindSize = spaceRemaining;
 
-			// Send packets
-			ObtainSemaphore(&db->db_WriteListSem);
-			counter = 8;   // Max of 8 per loop      
-			for(struct IOSana2Req *ior = (struct IOSana2Req *)db->db_WriteList.lh_Head; (nextwrite = (struct IOSana2Req *) ior->ios2_Req.io_Message.mn_Node.ln_Succ) != NULL; ior = nextwrite ) {
-				ULONG res = write_frame(ior, packetData, scsiDevice, db);
-				Remove((struct Node*)ior);
-				DevTermIO(db, (struct IORequest *)ior);
-				morePackets=1;
-				counter--;
-				if (!counter) break;
+					// Calculate packet size
+				    if (ior->ios2_Req.io_Flags & SANA2IOF_RAW) {
+						if (sz + 2 > spaceRemaining) break;
+						dataOut[0] = sz >> 8;
+						dataOut[1] = sz & 0xFF;
+						dataOut+=2;
+						spaceRemaining -= 2;
+						
+				    } else {
+						USHORT fullSize = sz + HW_ETH_HDR_SIZE;
+						if (fullSize + 2 > spaceRemaining) break;
+						dataOut[0] = fullSize >> 8;
+						dataOut[1] = fullSize & 0xFF;
+						dataOut+=2;
+						spaceRemaining -= 2;
+
+						*((USHORT*)(dataOut+12)) = (USHORT)ior->ios2_PacketType;
+						// Add ethernet header
+						memcpy(dataOut, ior->ios2_DstAddr, HW_ADDRFIELDSIZE);
+						memcpy(dataOut+6, HW_MAC, HW_ADDRFIELDSIZE);
+						dataOut += HW_ETH_HDR_SIZE;
+						spaceRemaining -= HW_ETH_HDR_SIZE;
+				    }
+				    // Add the data
+				    struct BufferManagement *bm = (struct BufferManagement *)ior->ios2_BufferManagement;				   
+					if (!(*bm->bm_CopyFromBuffer)(dataOut, ior->ios2_Data, sz)) {
+						ior->ios2_Req.io_Error = S2ERR_SOFTWARE;
+						ior->ios2_WireError = S2WERR_BUFF_ERROR;
+						DoEvent(db, S2EVENT_ERROR | S2EVENT_BUFF | S2EVENT_SOFTWARE);
+						D(("bm_CopyFromBuffer FAIL"));		
+						dataOut = rewind;		
+						spaceRemaining = rewindSize;					
+						Remove((struct Node*)ior);
+						DevTermIO(db, (struct IORequest *)ior);
+					} else {						
+						if (pendingSendsSave) {
+							*pendingSendsSave = ior; 
+							pendingSendsSave++;
+						} else {
+							ior->ios2_Req.io_Error = ior->ios2_WireError = 0;
+							db->db_DevStats.PacketsSent++;
+							DevTermIO(db, (struct IORequest *)ior);
+						}						
+						Remove((struct Node*)ior);
+						dataOut += sz;
+						spaceRemaining -= sz;
+						counter++;
+					}
+					if (counter>=db->db_maxPackets) break;   // limit packet total
+					ior = nextwrite;
+				}
+				ReleaseSemaphore(&db->db_WriteListSem);
+				// Now actually transmit them
+				if (counter) {
+					const USHORT totalSize = dataOut-packetData;
+					packetData[0] = counter >> 8;
+					packetData[1] = counter & 0xFF;
+					if (!SCSIWifi_AmigaNetSendFrames(scsiDevice, packetData, totalSize)) {
+						D(("SEND FAIL"));
+						logMessage(db,"PacketServer: Warning - Send Failed to Device");
+						if (pendingSends) {							
+							for (struct IOSana2Req **req = pendingSends; req<pendingSendsSave; req++) {							
+								(*req)->ios2_Req.io_Error = S2ERR_TX_FAILURE; (*req)->ios2_WireError = S2WERR_GENERIC_ERROR;
+								DevTermIO(db, (struct IORequest *)(*req));
+								DoEvent(db, S2EVENT_ERROR | S2EVENT_TX | S2EVENT_HARDWARE);
+							}
+						}
+					} else {
+						//logMessagef(db,"PacketServer: Sent %ld Packets (Total Size=%ld)", counter, totalSize);
+						if (pendingSends) {
+							for (struct IOSana2Req **req = pendingSends; req<pendingSendsSave; req++) {												
+								(*req)->ios2_Req.io_Error = (*req)->ios2_WireError = 0;
+								DevTermIO(db, (struct IORequest *)(*req));								
+							}
+						}
+						db->db_DevStats.PacketsSent+=counter;
+					}
+				}
+			} else {
+				// Send packets
+				ObtainSemaphore(&db->db_WriteListSem);
+				counter = 8;   // Max of 8 per loop      
+				for(struct IOSana2Req *ior = (struct IOSana2Req *)db->db_WriteList.lh_Head; (nextwrite = (struct IOSana2Req *) ior->ios2_Req.io_Message.mn_Node.ln_Succ) != NULL; ior = nextwrite ) {
+					ULONG res = write_frame(ior, packetData, scsiDevice, db);
+					Remove((struct Node*)ior);
+					DevTermIO(db, (struct IORequest *)ior);
+					morePackets=1;
+					counter--;
+					if (!counter) break;
+				}
+				ReleaseSemaphore(&db->db_WriteListSem);
 			}
-			ReleaseSemaphore(&db->db_WriteListSem);
-
+			
 			if (recv & SIGBREAKF_CTRL_C) {
 				D(("Terminate Requested"));
 			} else {
@@ -976,6 +1240,7 @@ __saveds void frame_proc() {
 					recv = Wait(SIGBREAKF_CTRL_C | timerSignalMask | SIGBREAKF_CTRL_F);
 				}
 			}
+			
 		} else {
 			// Not enabled? Pause for a decent amount of time
 			time_req->tr_time.tv_micro = 250 * 1000L;
@@ -986,27 +1251,33 @@ __saveds void frame_proc() {
 	}
 	
 	D(("scsidayna_task: exiting loop\n"));
+	logMessage(db,"PacketServer: Shutting down [1]");
 	
-	// Make sure it's finished
+	// Make sure it's finished - this prevents an intermittent crash at shutdown!
 	if (CheckIO((struct IORequest *)time_req)) { // IO is pending
         AbortIO((struct IORequest *)time_req);
         WaitIO((struct IORequest *)time_req);  // wait until IO fully done
     }
 	
 	D(("scsidayna_task: i/o shutdown\n"));
+	logMessage(db,"PacketServer: Shutting down [2]");
 
 	SCSIWifi_enable(scsiDevice, 0); 
 	DoEvent(db, S2EVENT_OFFLINE);
 	rejectAllPackets(db);
 	FreeVec(packetData);
+	if (pendingSends) FreeVec(pendingSends);
 	
 	SCSIWifi_close(scsiDevice);
+	
+	logMessage(db,"PacketServer: Shutting down [3]");
 	
 	CloseDevice((struct IORequest *)time_req);
 	DeleteIORequest((struct IORequest *)time_req);
 	FreeSignal(timerPort.mp_SigBit);
 	
+	logMessage(db,"PacketServer: Closed");
+	
 	Forbid();
 	ReleaseSemaphore(&db->db_ProcSem);
-	D(("scsidayna_task: shutdown\n"));
 }

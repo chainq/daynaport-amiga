@@ -343,6 +343,7 @@ struct S2LogMessage
 #define S2_CONNECT                0xC005
 #define S2_DISCONNECT             0xC006
 #define S2_SAMPLE_THROUGHPUT      0xC007
+#define S2_SANA2HOOK              0xC008
 
 /*
 ** Defined errors for io_Error (see also <exec/errors.h>)
