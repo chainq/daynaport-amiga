@@ -9,7 +9,7 @@ This code was originally based on the MNT ZZ9000Net driver by Lukas F. Hartmann 
 This will work with the older firmware, (BlueSCSI v2024.10.26, ZuluSCSI v2024.03.07)
 **however** To use the new BATCH transfer speed for increased speed:
 - Create or rename your NE4 file to AM4 - "AM" is for "Amiga"
-- Optionally play with some of the new settings in the ini file, eg: DATASIZE
+- Optionally play with some of the new settings in the prefs file, eg: DATASIZE
 
 ### OLD!!!! Setup Guides:
 - [YouTube video by Retronaut](https://www.youtube.com/watch?v=FDtqd04bq-k)
