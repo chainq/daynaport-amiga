@@ -1,5 +1,5 @@
 /*
- * SCSI DaynaPORT Device (scsidayna.device) by RobSmithDev 
+ * SCSI DaynaPORT Device (scsidayna.device) Copyright (C) 2024-2026 RobSmithDev 
  * DaynaPORT Interface Commands
  *
  */
@@ -11,6 +11,10 @@
 #include <proto/dos.h>
 #include <proto/utility.h>
 #include <devices/scsidisk.h>
+#include <proto/exec.h>
+#include <exec/types.h>
+#include <exec/memory.h>
+#include <stdarg.h>
 #include <string.h>
 #include "macros.h"
 #include <stdio.h>
@@ -21,7 +25,6 @@
 
 #define SCSI_INQUIRY                        0x12
 #define SCSI_NETWORK_WIFI_READFRAME         0x08
-#define SCSI_NETWORK_WIFI_GETMACADDRESS     0x09  // gvpscsi.device doesn't like this command code
 #define SCSI_NETWORK_WIFI_WRITEFRAME        0x0A
 #define SCSI_NETWORK_WIFI_ADDMULTICAST      0x0D
 #define SCSI_NETWORK_WIFI_ENABLE            0x0E
@@ -35,12 +38,22 @@
 #define SCSI_NETWORK_WIFI_OPT_INFO			0x04
 #define SCSI_NETWORK_WIFI_OPT_JOIN			0x05
 #define SCSI_NETWORK_WIFI_OPT_ALTREAD       0x08    
-#define SCSI_NETWORK_WIFI_OPT_GETMACADDRESS 0x09    
+#define SCSI_NETWORK_WIFI_OPT_GETMACADDRESS 0x09
+#define SCSI_NETWORK_WIFI_OPT_ALTWRITE      0x0A    
+#define SCSI_NETWORK_WIFI_CMD_AMIGANET_INFO 0x0B
+#define SCSI_NETWORK_WIFI_OPT_ALTREAD2      0x0C
+#define SCSI_NETWORK_WIFI_OPT_ALTWRITE2     0x0D    
+
+#define AMIGENET_MODE 1
+#define AMIGASCSI_PATCH_24BYTE_BLOCKSIZE  0xA8		// When receiving keep to blocks of 24 bytes
+#define AMIGASCSI_PATCH_ONEBLOCK          0xA9		// Write in one command, not two
+#define AMIGASCSI_BATCHMODE               0x40      // Batch Mode Bitmask
+
 
 #define INQUIRE_BUFFER_SIZE                 64
 
-#define NUM_TOKENS 7
-static char* CONFIG_TOKENS[NUM_TOKENS] = {"DEVICE","DEVICEID","PRIORITY","MODE","AUTOCONNECT","SSID","KEY"};
+#define NUM_TOKENS 9
+static char* CONFIG_TOKENS[NUM_TOKENS] = {"DEVICE","DEVICEID","PRIORITY","MODE","AUTOCONNECT","SSID","KEY","DATASIZE","DEBUG"};
 
 // Prepares the SCSI command and resets some of the result values
 #define SCSI_PREPCMD(device, cmd, sub, a, b, c, d) \
@@ -59,13 +72,15 @@ struct SCSIDevice {
     struct MsgPort* Port;    
     struct SCSICmd Cmd;
     char senseData[20];
-    USHORT scsiMode;
     UBYTE* scsiCommand;    // buffer to hold command, 16-bit aligned (12 bytes)
+    USHORT scsiMode;
+	USHORT isAmigaWIFI;    // Set to 1 if this uses the new AmigaWIFI interface rather than the Daynaport one
 };
 
 #define SysBase dev->sc_SysBase
 #define UtilityBase dev->sc_UtilityBase
 #define DOSBase dev->sc_dosBase
+
 
 typedef struct SCSIDevice* LSCSIDevice;
 
@@ -81,8 +96,8 @@ void muldiv(USHORT num, USHORT divide, USHORT* result, USHORT* mod) {
 }
 
 // convert USHORT to string and appends a new line character
-void _ustoa(USHORT num, char* str) {
-    char buffer[16];
+void _ustoa(USHORT num, char* str) {	
+    char buffer[8];
     char* s = buffer;
     USHORT divres, divmod;
     do {
@@ -98,7 +113,7 @@ void _ustoa(USHORT num, char* str) {
 
 // convert SHORT to string and appends a new line character
 void _stoa(SHORT num, char* str) {
-    char buffer[16];
+    char buffer[10];
     char* s = buffer;
     USHORT divres, divmod, number;
 
@@ -189,6 +204,8 @@ void SCSIWifi_defaultSettings(struct ScsiDaynaSettings* settings) {
     settings->autoConnect = 0;   // auto connect to the WIFI?
     strcpy(settings->ssid, "");
     strcpy(settings->key, "");
+	settings->debug = 1;       // Logging by default
+	settings->maxDataSize = 8192;
 }
 
 // Loads settings from the ENV, returns 0 if the settings were bad and defaults were setup
@@ -203,6 +220,7 @@ LONG SCSIWifi_loadSettings(void *utilityBase, void* dosBase, struct ScsiDaynaSet
     BPTR fh;
     if (fh = Open("ENV:scsidayna.prefs",MODE_OLDFILE)) {
         char buffer[128];
+		settings->debug = 0;    // If file exists turn off logging by default
         USHORT matches = 0;
         while (FGets(fh, buffer, 128)) {
             char* value;
@@ -225,6 +243,8 @@ LONG SCSIWifi_loadSettings(void *utilityBase, void* dosBase, struct ScsiDaynaSet
                             case 4: settings->autoConnect = _atous(value); break;
                             case 5: strcpy_s(settings->ssid, value, 64); break;
                             case 6: strcpy_s(settings->key, value, 64); break;
+							case 7: settings->maxDataSize = _atous(value); break;
+							case 8: settings->debug = _atos(value) != 0; break;							
                             default: matches--; break;
                         }
                         break;
@@ -266,6 +286,8 @@ LONG SCSIWifi_saveSettings(struct DosBase *dosBase, struct ScsiDaynaSettings* se
                 case 4:  _ustoa(settings->autoConnect, tmp);  if (!FPuts(fh, tmp)) good = 0; break;
                 case 5:  if (!FPuts(fh, settings->ssid)) good = 0; break;
                 case 6:  if (!FPuts(fh, settings->key)) good = 0; break;
+				case 7:  _ustoa(settings->maxDataSize, tmp);  if (!FPuts(fh, tmp)) good = 0; break;
+				case 8:  _ustoa(settings->debug, tmp);  if (!FPuts(fh, tmp)) good = 0; break;
             }
             if (!FPuts(fh, "\n")) good = 0;
         }
@@ -356,6 +378,7 @@ SCSIWIFIDevice SCSIWifi_open(struct SCSIDevice_OpenData* openData, enum SCSIWifi
     {
         struct SCSIDevice devTmp;
         dev = &devTmp;
+		dev->isAmigaWIFI = 0;
         dev->sc_SysBase = openData->sysBase;
         dev->sc_UtilityBase = openData->utilityBase;
         dev->sc_dosBase = openData->dosBase;
@@ -383,8 +406,8 @@ SCSIWIFIDevice SCSIWifi_open(struct SCSIDevice_OpenData* openData, enum SCSIWifi
             _SCSIWifi_close(dev);
             return NULL;
         }
-        // 6 bytes for command, 6 used by some of the status replies
-        dev->scsiCommand = AllocVec(12, MEMF_PUBLIC|MEMF_CLEAR);
+        // Space for the command and a bit for the result
+        dev->scsiCommand = AllocVec(32, MEMF_PUBLIC|MEMF_CLEAR);
 
         // Open driver
         BYTE err = OpenDevice(openData->deviceDriverName, openData->deviceID, (struct IORequest*)dev->SCSIReq, 0);
@@ -429,16 +452,27 @@ SCSIWIFIDevice SCSIWifi_open(struct SCSIDevice_OpenData* openData, enum SCSIWifi
         }
         // Check the result
         if (dev->Cmd.scsi_Actual > 26) {
-            // A little hacky but will work for us
-            tmpBuffer[13] = '\0';
-            tmpBuffer[25] = '\0';
-            // Check it's the device we're looking for
-            if ((Stricmp(&tmpBuffer[8], "Dayna") == 0) && 
-                (Stricmp(&tmpBuffer[16], "SCSI/Link") == 0)) {
-                FreeVec(tmpBuffer);
-                *errorCode = sworOK;
-                return (SCSIWIFIDevice)dev;
-            }      
+			// Look for AmigaNET first
+			char buf[10];
+			tmpBuffer[25] = '\0';
+			memcpy(buf, &tmpBuffer[8], 8); buf[8] = '\0';
+			if (Stricmp(buf, "AmigaNET") == 0) {
+				if (Stricmp(&tmpBuffer[16], "SCSI/Link") == 0) {
+					dev->isAmigaWIFI = 1;
+					FreeVec(tmpBuffer);
+					*errorCode = sworGreat;
+					return (SCSIWIFIDevice)dev;
+				}
+			} else {
+				tmpBuffer[13] = '\0';
+				// Check it's the device we're looking for
+				if ((Stricmp(&tmpBuffer[8], "Dayna") == 0) && 
+					(Stricmp(&tmpBuffer[16], "SCSI/Link") == 0)) {
+					FreeVec(tmpBuffer);
+					*errorCode = sworOK;
+					return (SCSIWIFIDevice)dev;
+				}      
+			}
         } 
         *errorCode = sworNotDaynaDevice;
         FreeVec(tmpBuffer);
@@ -668,7 +702,6 @@ LONG SCSIWifi_sendFrame(SCSIWIFIDevice device, UBYTE* packet, UWORD packetSize) 
 }
 
 
-
 // On ENTRY, packetSize should be the memory size of packetBuffer, which SHOULD be NETWORK_PACKET_MAX_SIZE + 6
 // If returns TRUE and packetSize=0 then no data is waiting to be read
 // Else packetSize will be what was read with the first 6 bytes being in the following format:
@@ -679,31 +712,114 @@ LONG SCSIWifi_sendFrame(SCSIWIFIDevice device, UBYTE* packet, UWORD packetSize) 
 //           3, 4 = 0
 //           5: 0 if this was the last packet, or 0x10 if there are more to read
 //      last 4 bytes are the CRC for the packet which we dont care about!
-LONG SCSIWifi_receiveFrame(SCSIWIFIDevice device, UBYTE* packetBuffer, UWORD* packetSize) {
+LONG SCSIWifi_receiveFrame(SCSIWIFIDevice device, UBYTE* packetBuffer, UWORD packetSize) {
     LSCSIDevice dev = (LSCSIDevice)device;
 
    switch (dev->scsiMode) {
        case 1:  // scsi.device mode
-            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_OPT_ALTREAD,  0xA8, (*packetSize) >> 8, (*packetSize) & 0xFF, 0);
+            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_OPT_ALTREAD,  AMIGASCSI_PATCH_24BYTE_BLOCKSIZE, packetSize >> 8, packetSize & 0xFF, 0);
             break;
 
         case 2:  // gvpscsi.device mode
-            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_OPT_ALTREAD,  0xA9, (*packetSize) >> 8, (*packetSize) & 0xFF, 0);
+            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_OPT_ALTREAD,  AMIGASCSI_PATCH_ONEBLOCK,  packetSize >> 8, packetSize & 0xFF, 0);
             break;
 
         default:
-            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_READFRAME, 0, 0, (*packetSize) >> 8, (*packetSize) & 0xFF, 0);
+            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_READFRAME, 0, 0, packetSize >> 8, packetSize & 0xFF, 0);
             break;
     }
     dev->Cmd.scsi_Data = (APTR)packetBuffer;
-    dev->Cmd.scsi_Length = *packetSize;
+    dev->Cmd.scsi_Length = packetSize;
     dev->Cmd.scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
 
     DoIO( (struct IORequest*)dev->SCSIReq ); 
 
     if ((dev->Cmd.scsi_Status) || (dev->Cmd.scsi_Actual < 6)) return 0;
 
-    *packetSize = dev->Cmd.scsi_Actual;
+    return dev->Cmd.scsi_Actual;
+}
 
+
+// Fetch details about the system for the new mode
+LONG SCSIWifi_getDeviceInfo(SCSIWIFIDevice device, struct SCSIWifi_DeviceInfo* devInfo) {
+	LSCSIDevice dev = (LSCSIDevice)device;
+
+    SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_CMD_AMIGANET_INFO, 0, 0, 0, 0);    
+	UBYTE* result = &dev->scsiCommand[6];
+
+    devInfo->valid = 0;
+    dev->Cmd.scsi_Data = (APTR)result;
+    dev->Cmd.scsi_Length = 12;
+    dev->Cmd.scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
+		
+    DoIO( (struct IORequest*)dev->SCSIReq );   
+
+    if (dev->Cmd.scsi_Status) return 0;
+
+    if (dev->Cmd.scsi_Actual == 12) {
+        memcpy(devInfo->macAddress, &result[6], 6);
+		devInfo->maxPacketsSize = (result[0] << 8) | result[1];
+		devInfo->maxPackets = (result[2] << 8) | result[3];
+        devInfo->valid = 1;
+        return 1;
+    }
+	
+    return 0;	
+}
+
+// Sends multiple ethernet frames to the SCSI device
+// Format is as follows:
+// 0/1 High/Low Byte: Total Packets
+// Then for each packet
+// 0/1 High/Low Byte: Packet Size (MAX upto MTU)
+//     2+ Packet Data
+LONG SCSIWifi_AmigaNetSendFrames(SCSIWIFIDevice device, UBYTE* packets, USHORT totalSize) {
+	LSCSIDevice dev = (LSCSIDevice)device;
+    
+    SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_WRITEFRAME, 0, AMIGASCSI_BATCHMODE, totalSize >> 8, totalSize & 0xFF, 0);
+    dev->Cmd.scsi_Data = (APTR)packets;
+    dev->Cmd.scsi_Length = totalSize;
+    dev->Cmd.scsi_Flags = SCSIF_WRITE | SCSIF_AUTOSENSE;
+
+    DoIO( (struct IORequest*)dev->SCSIReq );     
+
+    if (dev->Cmd.scsi_Status) return 0;
     return 1;
+}
+
+
+// New faster command for receiving packets. The amount of data received actually is returned. 
+// The format of this buffer is
+// 0/1 High Byte, Low Byte: Number of Packets Received
+// 2   Set to 1 if there are more packets waiting
+// 3   Reserved.
+// Then, for each packet
+//    0 High Byte of packet size
+//    1 Low Byte of packet size
+//    2+ Packet Data
+LONG SCSIWifi_AmigaNetRecvFrames(SCSIWIFIDevice device, UBYTE* packetBuffer, UWORD bufferSize) {
+    LSCSIDevice dev = (LSCSIDevice)device;
+
+   switch (dev->scsiMode) {
+       case 1:  // scsi.device mode
+            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_OPT_ALTREAD,  AMIGASCSI_PATCH_24BYTE_BLOCKSIZE|AMIGASCSI_BATCHMODE, bufferSize >> 8, bufferSize & 0xFF, 0);
+            break;
+
+        case 2:  // gvpscsi.device mode
+            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_OPT_ALTREAD,  AMIGASCSI_PATCH_ONEBLOCK|AMIGASCSI_BATCHMODE,  bufferSize >> 8, bufferSize & 0xFF, 0);
+            break;
+
+        default:
+            SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_READFRAME, 0, AMIGASCSI_BATCHMODE, bufferSize >> 8, bufferSize & 0xFF, 0);
+            break;
+    }
+    dev->Cmd.scsi_Data = (APTR)packetBuffer;
+    dev->Cmd.scsi_Length = bufferSize;
+    dev->Cmd.scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
+
+    DoIO( (struct IORequest*)dev->SCSIReq ); 
+
+    if ((dev->Cmd.scsi_Status) || (dev->Cmd.scsi_Actual < 4)) return 0;
+
+    return dev->Cmd.scsi_Actual;
 }

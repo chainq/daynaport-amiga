@@ -1,5 +1,5 @@
 /*
- * SCSI DaynaPORT Device (scsidayna.device) by RobSmithDev 
+ * SCSI DaynaPORT Device (scsidayna.device) Copyright (C) 2024-2026 RobSmithDev 
  * DaynaPORT Interface Commands
  *
  */
@@ -23,8 +23,8 @@
 #define SCSIWIFI_PACKET_MAX_SIZE     1520
 #define SCSIWIFI_PACKET_MTU_SIZE     1500
 
-// Result from calling SCSIWifi_open
-enum SCSIWifi_OpenResult {sworOK, sworOpenDeviceFailed, sworOutOfMem, sworInquireFail, sworNotDaynaDevice};
+// Result from calling SCSIWifi_open - sworGreat means its using the new AmigaNET driver
+enum SCSIWifi_OpenResult {sworOK, sworGreat, sworOpenDeviceFailed, sworOutOfMem, sworInquireFail, sworNotDaynaDevice};
 
 // Current status of a WIFI scan
 enum SCSIWifi_ScanStatus {swssBusy, swssComplete, swssNotRunning, swssError};
@@ -37,6 +37,15 @@ enum SCSIWifi_ScanStatus {swssBusy, swssComplete, swssNotRunning, swssError};
 #define STRUCT_PACKED  __attribute__((packed))
 #define STRUCT_ALIGN16 __attribute__((aligned (16)))
 #endif
+
+// Structure for MAC addresses from WIFI scsi
+struct STRUCT_PACKED SCSIWifi_DeviceInfo {
+    UBYTE valid;
+    UBYTE _padding;
+	USHORT maxPacketsSize;		// Maximum size of packet data (multiple packets)
+	USHORT maxPackets;			// Maximum number of supported packets per call
+    UBYTE macAddress[6];			// Device mac address
+};
 
 // Structure for MAC addresses from WIFI scsi
 struct STRUCT_PACKED SCSIWifi_MACAddress {
@@ -74,9 +83,13 @@ struct ScsiDaynaSettings {
   // Driver mode
   USHORT scsiMode;
   // Auto-connect to this wifi network
-  USHORT autoConnect;
+  USHORT autoConnect;  
   char ssid[64];
   char key[64];
+  // Max data size in AmigaNET mode
+  ULONG maxDataSize;
+  // If debug is enabled - creates a console window and shows the output
+  UBYTE debug;
 };
 
 #ifdef __VBCC__
@@ -159,7 +172,19 @@ LONG SCSIWifi_sendFrame(SCSIWIFIDevice device, UBYTE* packet, UWORD packetSize);
 //           1: Low Byte of packet size
 //           2, 3, 4 = 0
 //           5: 0 if this was the last packet, or 0x10 if there are more to read
-LONG SCSIWifi_receiveFrame(SCSIWIFIDevice device, UBYTE* packetBuffer, UWORD* packetSize);
+LONG SCSIWifi_receiveFrame(SCSIWIFIDevice device, UBYTE* packetBuffer, UWORD packetSize);
+
+////////////// Commands for AmigaNET mode ////////////////////////////////////////////////////////////////////////
+
+// Fetch details about the system
+LONG SCSIWifi_getDeviceInfo(SCSIWIFIDevice device, struct SCSIWifi_DeviceInfo* devInfo);
+
+// New faster command for sending multiple packets.
+LONG SCSIWifi_AmigaNetSendFrames(SCSIWIFIDevice device, UBYTE* packets, USHORT totalSize);
+
+// New faster command for receiving packets. The actual buffer size is returned.
+LONG SCSIWifi_AmigaNetRecvFrames(SCSIWIFIDevice device, UBYTE* packetBuffer, UWORD bufferSize);
+
 
 
 #endif

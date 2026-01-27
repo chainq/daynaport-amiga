@@ -343,6 +343,7 @@ struct S2LogMessage
 #define S2_CONNECT                0xC005
 #define S2_DISCONNECT             0xC006
 #define S2_SAMPLE_THROUGHPUT      0xC007
+#define S2_SANA2HOOK              0xC008
 
 /*
 ** Defined errors for io_Error (see also <exec/errors.h>)
@@ -369,6 +370,7 @@ struct S2LogMessage
 **  IOERR_UNITBUSY   (-6) * device opens ok, but requested unit is busy *
 **  IOERR_SELFTEST   (-7) * hardware failed self-test *
 */
+#define IOERR_OPENED (-8)
 
 /*
 ** Defined errors for ios2_WireError
@@ -416,6 +418,13 @@ struct S2LogMessage
 #define S2EVENT_CONFIGCHANGED (1UL<< 8) /* driver configuration changed */
 #define S2EVENT_CONNECT       (1UL<< 9) /* driver has opened session */
 #define S2EVENT_DISCONNECT    (1UL<<10) /* driver has closed session */
+
+ 
+struct Sana2Hook
+{
+	struct Hook s2h_Hook;
+	Tag*   s2h_Methods;
+};
 
 /****************************************************************************/
 

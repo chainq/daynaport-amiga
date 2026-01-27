@@ -1,11 +1,17 @@
 # Amiga DaynaPORT Driver for BlueSCSI V2 and ZuluSCSI
 Created by RobSmithDev
 
-This is an implementation of a SANA-II driver for the Amiga, which allows you to use either a Pico W enabled BlueSCSI V2, or various WiFi equipped ZuluSCSI models to give internet access to the machine!
+This is an implementation of a SANA-II driver for the Amiga, which allows you to use either a PicoW enabled BlueSCSI V2, or various WiFi equipped ZuluSCSI models to give internet access to the machine!
 
-This code is based on the MNT ZZ9000Net driver by Lukas F. Hartmann (which is based on work by Henryk Richter) and also borrows a little from the PlipBox device driver, which has several contributors.
+This code was originally based on the MNT ZZ9000Net driver by Lukas F. Hartmann (which is based on work by Henryk Richter) and also borrows a little from the PlipBox device driver, which has several contributors.
 
-Setup Guides:
+### NEW Setup Information
+This will work with the older firmware, (BlueSCSI v2024.10.26, ZuluSCSI v2024.03.07)
+**however** To use the new BATCH transfer speed for increased speed:
+- Create or rename your NE4 file to AM4 - "AM" is for "Amiga"
+- Optionally play with some of the new settings in the ini file, eg: DATASIZE
+
+### OLD!!!! Setup Guides:
 - [YouTube video by Retronaut](https://www.youtube.com/watch?v=FDtqd04bq-k)
 - [BlueSCSI Docs](https://github.com/blueSCSI/blueSCSI-v2/wiki/WiFi-Amiga)
 - [Discord](https://discord.gg/pQsU3CR9fe)
@@ -52,6 +58,8 @@ MODE=1
 AUTOCONNECT=0
 SSID=
 KEY=
+DATASIZE=
+DEBUG=
 ```
 
 where:
@@ -62,6 +70,8 @@ where:
 - AUTOCONNECT 0/1 if 1, the driver will attempt to connect to the WIFI device (you can also configure BlueSCSI or ZuluSCSI to do this)
 - SSID The SSID/Wifi name to connect to if autoconnect=1
 - KEY the wifi key/password
+- DATASIZE With the new Scsi firmware, you can bulk-transfer packet data upto this amount for increased speed (defaults to 8192, some devices might not support different sizes)
+- DEBUG 0/1 Causes a console window to appear to help debug issues with the driver, disable when sorted or it slows things down
 
 ## Mode
 This patches around weirdness in the various SCSI drivers. Mode should be:
