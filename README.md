@@ -10,6 +10,7 @@ This will work with the older firmware, (BlueSCSI v2024.10.26, ZuluSCSI v2024.03
 **however** To use the new BATCH transfer speed for increased speed:
 - Create or rename your NE4 file to AM4 - "AM" is for "Amiga"
 - Optionally play with some of the new settings in the prefs file, eg: DATASIZE
+- TIP: Actually performs better with priority set to 0!
 
 ### OLD!!!! Setup Guides:
 - [YouTube video by Retronaut](https://www.youtube.com/watch?v=FDtqd04bq-k)
@@ -83,5 +84,9 @@ This patches around weirdness in the various SCSI drivers. Mode should be:
 This needs to match the SCSI interface you're using. You can check this using HDToolbox (see what device it uses in the tool type) or SCSIMounter etc.
 
 ## Task Priority
-A small note about task priority. If left at 0 the device will function perfectly fine, however the throughput of data is somewhat all over the place.
+A small note about task priority. 
+
+With the new driver, leave this at zero as it performs better!
+With the original driver:
+If left at 0 the device will function perfectly fine, however the throughput of data is somewhat all over the place.
 If you want a really stable throughput, then set this to '1', but also expect this will possibly slow down some of the other applications running on your system.
