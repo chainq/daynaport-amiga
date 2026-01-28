@@ -86,7 +86,5 @@ This needs to match the SCSI interface you're using. You can check this using HD
 ## Task Priority
 A small note about task priority. 
 
-With the new driver, leave this at zero as it performs better!
-With the original driver:
-If left at 0 the device will function perfectly fine, however the throughput of data is somewhat all over the place.
-If you want a really stable throughput, then set this to '1', but also expect this will possibly slow down some of the other applications running on your system.
+- With the new driver, leave this at zero as it performs better!
+- With the original driver, left at 0 the device will function perfectly fine, however the throughput of data is somewhat all over the place. For stable throughput, then set this to '1', but also expect this will possibly slow down some of the other applications running on your system.
